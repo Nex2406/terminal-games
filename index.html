@@ -1,0 +1,481 @@
+﻿<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <title>Retro Quest</title>
+</head>
+<body style="margin:0;background:#0b1021;color:#fff;font-family:Arial,Helvetica,sans-serif;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;gap:10px;">
+  <h2 style="margin:0;letter-spacing:2px;">RETRO QUEST</h2>
+  <canvas id="game" width="960" height="540" style="border:2px solid #ffffff22;border-radius:14px;max-width:95vw;height:auto;background:#7fd3ff;box-shadow:0 20px 70px rgba(0,0,0,.35);"></canvas>
+  <div id="status">← → move · ↑ / Space jump · collect coins · stomp bots · reach the flag</div>
+  <div>
+    <button onclick="restartLevel()">Restart Level</button>
+    <button onclick="restartGame()">Restart Game</button>
+    <button onclick="togglePause()">Pause / Resume</button>
+    <button onclick="exitGame()">Exit</button>
+  </div>
+
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const statusEl = document.getElementById('status');
+
+const VIEW_W = canvas.width;
+const VIEW_H = canvas.height;
+const TILE = 40;
+const GRAVITY = 0.52;
+const ACCEL = 0.7;
+const MAX_SPEED = 4.6;
+const JUMP_POWER = -11.2;
+const MAX_FALL = 15;
+
+let keys = {};
+let player;
+let world;
+let cameraX = 0;
+let cameraY = 0;
+let paused = false;
+let gameWon = false;
+let gameOver = false;
+let currentLevel = 0;
+let totalScore = 0;
+let globalLives = 3;
+
+const levels = [
+[
+"............................................................",
+"............................................................",
+"......................................................C.....",
+"...............................................C............",
+".............................C..............................",
+"..............C......................................G.....",
+".....C....................####.....................#####....",
+"..S......####............................C..................",
+"..############................###...........E...............",
+"......####...........C......................................",
+"..................#####.................#####...............",
+"..................................C.........................",
+".............####...........E...............................",
+"........................#########...........................",
+"...........C......................................C.........",
+".....#####.............#####..............#####.............",
+"............................C...............................",
+".................####..................E....................",
+"....^....^....................C..................^....^.....",
+"################....##################....##################"
+],
+[
+"............................................................",
+"............................................................",
+"....................................................C.......",
+"............................C..................####.........",
+".............C..............................................",
+"....S.............................E.....................G...",
+"..#######........#####..............................C...####",
+"............................................................",
+"....................####............#####...................",
+"..........E...................C.............................",
+"......................C.................E...................",
+"......#####.........................########................",
+"............................................................",
+".................####......C..................####..........",
+"............................................................",
+".....C.........................#####........................",
+"...........#####.......................C....................",
+"..................................E.........................",
+"..^......^.........^......^..............^......^...........",
+"############################....############################"
+]
+];
+
+function rectsOverlap(a, b) {
+  return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+}
+
+function buildLevel(index) {
+  const rows = levels[index].slice();
+  const width = rows.reduce((m, r) => Math.max(m, r.length), 0);
+  const tiles = rows.map(r => r.padEnd(width, '.').split(''));
+  const coins = [];
+  const enemies = [];
+  const spikes = [];
+  let spawn = { x: 80, y: 80 };
+  let goal = { x: (width - 4) * TILE, y: 4 * TILE, w: 30, h: 60 };
+  let coinTotal = 0;
+
+  for (let y = 0; y < tiles.length; y++) {
+    for (let x = 0; x < tiles[y].length; x++) {
+      const ch = tiles[y][x];
+      if (ch === 'S') {
+        spawn = { x: x * TILE + 6, y: y * TILE + 2 };
+        tiles[y][x] = '.';
+      } else if (ch === 'C') {
+        coins.push({ x: x * TILE + TILE / 2, y: y * TILE + TILE / 2, r: 10, collected: false, bob: Math.random() * Math.PI * 2 });
+        coinTotal++;
+        tiles[y][x] = '.';
+      } else if (ch === 'E') {
+        enemies.push({ x: x * TILE + 6, y: y * TILE + 8, w: 28, h: 28, vx: Math.random() > 0.5 ? 1.2 : -1.2, vy: 0, alive: true });
+        tiles[y][x] = '.';
+      } else if (ch === '^') {
+        spikes.push({ x: x * TILE, y: y * TILE + 24, w: TILE, h: 16 });
+        tiles[y][x] = '.';
+      } else if (ch === 'G') {
+        goal = { x: x * TILE + 8, y: y * TILE - 20, w: 26, h: 72 };
+        tiles[y][x] = '.';
+      }
+    }
+  }
+
+  return {
+    width, height: tiles.length, tiles, coins, enemies, spikes,
+    spawn, goal, coinTotal, coinsCollected: 0
+  };
+}
+
+function createPlayer(x, y) {
+  return { x, y, w: 28, h: 36, vx: 0, vy: 0, onGround: false, coyote: 0, jumpBuffer: 0, facing: 1, invuln: 0, anim: 0 };
+}
+
+function snapCamera() {
+  const maxCamX = Math.max(0, world.width * TILE - VIEW_W);
+  const maxCamY = Math.max(0, world.height * TILE - VIEW_H);
+  cameraX = Math.max(0, Math.min(maxCamX, player.x + player.w / 2 - VIEW_W / 2));
+  cameraY = Math.max(0, Math.min(maxCamY, player.y + player.h / 2 - VIEW_H / 2));
+}
+
+function loadLevel(index, keepLives = true) {
+  currentLevel = index;
+  world = buildLevel(index);
+  player = createPlayer(world.spawn.x, world.spawn.y);
+  paused = false; gameWon = false; gameOver = false;
+  if (!keepLives) { globalLives = 3; totalScore = 0; }
+  snapCamera();
+  updateStatus();
+}
+
+function restartLevel() { loadLevel(currentLevel, true); }
+function restartGame() { globalLives = 3; totalScore = 0; loadLevel(0, true); }
+function togglePause() { if (gameOver || gameWon) return; paused = !paused; updateStatus(); }
+function exitGame() { document.body.innerHTML = '<div style="text-align:center;color:white;font-family:Arial"><h2>Game exited safely</h2><p>You may close this tab.</p></div>'; }
+
+function solidAt(tx, ty) {
+  if (ty < 0) return false;
+  if (tx < 0 || tx >= world.width) return true;
+  if (ty >= world.height) return false;
+  return world.tiles[ty][tx] === '#';
+}
+
+function spikeHit(rect) { return world.spikes.some(s => rectsOverlap(rect, s)); }
+
+function moveX(entity) {
+  entity.x += entity.vx;
+  if (entity.vx > 0) {
+    const right = Math.floor((entity.x + entity.w - 1) / TILE);
+    const top = Math.floor(entity.y / TILE);
+    const bottom = Math.floor((entity.y + entity.h - 1) / TILE);
+    for (let ty = top; ty <= bottom; ty++) {
+      if (solidAt(right, ty)) { entity.x = right * TILE - entity.w; entity.vx = 0; return true; }
+    }
+  } else if (entity.vx < 0) {
+    const left = Math.floor(entity.x / TILE);
+    const top = Math.floor(entity.y / TILE);
+    const bottom = Math.floor((entity.y + entity.h - 1) / TILE);
+    for (let ty = top; ty <= bottom; ty++) {
+      if (solidAt(left, ty)) { entity.x = (left + 1) * TILE; entity.vx = 0; return true; }
+    }
+  }
+  return false;
+}
+
+function moveY(entity) {
+  entity.onGround = false;
+  entity.y += entity.vy;
+  if (entity.vy > 0) {
+    const bottom = Math.floor((entity.y + entity.h - 1) / TILE);
+    const left = Math.floor(entity.x / TILE);
+    const right = Math.floor((entity.x + entity.w - 1) / TILE);
+    for (let tx = left; tx <= right; tx++) {
+      if (solidAt(tx, bottom)) { entity.y = bottom * TILE - entity.h; entity.vy = 0; entity.onGround = true; return true; }
+    }
+  } else if (entity.vy < 0) {
+    const top = Math.floor(entity.y / TILE);
+    const left = Math.floor(entity.x / TILE);
+    const right = Math.floor((entity.x + entity.w - 1) / TILE);
+    for (let tx = left; tx <= right; tx++) {
+      if (solidAt(tx, top)) { entity.y = (top + 1) * TILE; entity.vy = 0; return true; }
+    }
+  }
+  return false;
+}
+
+function groundAhead(enemy) {
+  const dir = enemy.vx >= 0 ? 1 : -1;
+  const checkX = dir > 0 ? enemy.x + enemy.w + 2 : enemy.x - 2;
+  const tx = Math.floor(checkX / TILE);
+  const ty = Math.floor((enemy.y + enemy.h + 2) / TILE);
+  return solidAt(tx, ty);
+}
+
+function hurtPlayer() {
+  if (player.invuln > 0 || gameOver || gameWon) return;
+  globalLives--;
+  if (globalLives <= 0) { gameOver = true; paused = false; updateStatus(); }
+  else { player = createPlayer(world.spawn.x, world.spawn.y); player.invuln = 80; snapCamera(); updateStatus('Ouch'); }
+}
+
+function collectCoins() {
+  for (const coin of world.coins) {
+    if (coin.collected) continue;
+    const box = { x: coin.x - 10, y: coin.y - 10, w: 20, h: 20 };
+    if (rectsOverlap(player, box)) { coin.collected = true; world.coinsCollected++; totalScore += 100; }
+  }
+}
+
+function updateEnemies() {
+  for (const e of world.enemies) {
+    if (!e.alive) continue;
+    e.vy = Math.min(e.vy + GRAVITY, MAX_FALL);
+    moveY(e);
+    const hitWall = moveX(e);
+    if (hitWall || !groundAhead(e)) e.vx *= -1;
+    if (rectsOverlap(player, e)) {
+      const stomp = player.vy > 1 && player.y + player.h - 10 < e.y + 10;
+      if (stomp) { e.alive = false; player.vy = -8.2; totalScore += 250; }
+      else hurtPlayer();
+    }
+  }
+}
+
+function updatePlayer() {
+  if (player.jumpBuffer > 0) player.jumpBuffer--;
+  if (player.invuln > 0) player.invuln--;
+  const leftHeld = keys['ArrowLeft'] || keys['a'] || keys['A'];
+  const rightHeld = keys['ArrowRight'] || keys['d'] || keys['D'];
+  if (leftHeld && !rightHeld) { player.vx = Math.max(player.vx - ACCEL, -MAX_SPEED); player.facing = -1; }
+  else if (rightHeld && !leftHeld) { player.vx = Math.min(player.vx + ACCEL, MAX_SPEED); player.facing = 1; }
+  else { player.vx *= player.onGround ? 0.78 : 0.92; if (Math.abs(player.vx) < 0.05) player.vx = 0; }
+  if (player.onGround) player.coyote = 7; else if (player.coyote > 0) player.coyote--;
+  if (player.jumpBuffer > 0 && player.coyote > 0) {
+    player.vy = JUMP_POWER; player.onGround = false; player.coyote = 0; player.jumpBuffer = 0;
+  }
+  player.vy = Math.min(player.vy + GRAVITY, MAX_FALL);
+  moveX(player);
+  moveY(player);
+  if (player.onGround && Math.abs(player.vx) > 0.2) player.anim += 0.16;
+  if (player.y > world.height * TILE + 120) hurtPlayer();
+  if (spikeHit(player)) hurtPlayer();
+  collectCoins();
+  updateEnemies();
+  if (rectsOverlap(player, world.goal)) {
+    if (currentLevel < levels.length - 1) { totalScore += 500; loadLevel(currentLevel + 1, true); updateStatus('Level cleared'); }
+    else { totalScore += 1000; gameWon = true; updateStatus(); }
+  }
+}
+
+function updateCamera() {
+  const targetX = player.x + player.w / 2 - VIEW_W / 2;
+  const targetY = player.y + player.h / 2 - VIEW_H / 2;
+  const maxCamX = Math.max(0, world.width * TILE - VIEW_W);
+  const maxCamY = Math.max(0, world.height * TILE - VIEW_H);
+  cameraX += (targetX - cameraX) * 0.14;
+  cameraY += (targetY - cameraY) * 0.14;
+  cameraX = Math.max(0, Math.min(maxCamX, cameraX));
+  cameraY = Math.max(0, Math.min(maxCamY, cameraY));
+}
+
+function updateStatus(extra = '') {
+  if (gameOver) { statusEl.innerText = `Game Over — Score: ${totalScore} — Restart Game`; return; }
+  if (gameWon) { statusEl.innerText = `You win — Score: ${totalScore}`; return; }
+  if (paused) { statusEl.innerText = `Paused — Level ${currentLevel + 1} — Score ${totalScore} — Lives ${globalLives}`; return; }
+  const txt = `Level ${currentLevel + 1} · Score ${totalScore} · Lives ${globalLives} · Coins ${world.coinsCollected}/${world.coinTotal}`;
+  statusEl.innerText = extra ? `${txt} · ${extra}` : txt;
+}
+
+function drawBackground() {
+  const g = ctx.createLinearGradient(0, 0, 0, VIEW_H);
+  g.addColorStop(0, '#82d7ff'); g.addColorStop(1, '#d9f4ff');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+  ctx.fillStyle = '#ffffffaa';
+  const cloudShift = (cameraX * 0.2) % 1200;
+  const cloudYOffset = cameraY * 0.1;
+  const clouds = [
+    [140 - cloudShift, 90 - cloudYOffset, 70],
+    [430 - cloudShift, 130 - cloudYOffset, 60],
+    [760 - cloudShift, 80 - cloudYOffset, 75],
+    [1080 - cloudShift, 110 - cloudYOffset, 65],
+    [1380 - cloudShift, 70 - cloudYOffset, 72]
+  ];
+  for (const [x, y, s] of clouds) {
+    ctx.beginPath();
+    ctx.arc(x, y, s * 0.28, 0, Math.PI * 2);
+    ctx.arc(x + s * 0.24, y - 12, s * 0.24, 0, Math.PI * 2);
+    ctx.arc(x + s * 0.48, y, s * 0.3, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.fillStyle = '#bce39f';
+  const hillBaseY = VIEW_H - cameraY * 0.25;
+  for (let i = -1; i < 8; i++) {
+    const hillX = i * 260 - (cameraX * 0.35 % 260);
+    ctx.beginPath();
+    ctx.moveTo(hillX, hillBaseY);
+    ctx.quadraticCurveTo(hillX + 130, hillBaseY - 160, hillX + 260, hillBaseY);
+    ctx.lineTo(hillX + 260, VIEW_H);
+    ctx.lineTo(hillX, VIEW_H);
+    ctx.closePath();
+    ctx.fill();
+  }
+}
+
+function drawTiles() {
+  const startX = Math.floor(cameraX / TILE) - 1;
+  const endX = startX + Math.ceil(VIEW_W / TILE) + 3;
+  const startY = Math.floor(cameraY / TILE) - 1;
+  const endY = startY + Math.ceil(VIEW_H / TILE) + 3;
+  for (let y = Math.max(0, startY); y < Math.min(world.height, endY); y++) {
+    for (let x = Math.max(0, startX); x < Math.min(world.width, endX); x++) {
+      if (world.tiles[y][x] !== '#') continue;
+      const px = x * TILE - cameraX;
+      const py = y * TILE - cameraY;
+      ctx.fillStyle = '#9b6b32'; ctx.fillRect(px, py, TILE, TILE);
+      ctx.fillStyle = '#c99048'; ctx.fillRect(px + 2, py + 2, TILE - 4, TILE - 4);
+      ctx.strokeStyle = '#7a4b1e'; ctx.lineWidth = 2;
+      ctx.strokeRect(px + 2, py + 2, TILE - 4, TILE - 4);
+      ctx.beginPath();
+      ctx.moveTo(px + TILE / 2, py + 2); ctx.lineTo(px + TILE / 2, py + TILE - 2);
+      ctx.moveTo(px + 2, py + TILE / 2); ctx.lineTo(px + TILE - 2, py + TILE / 2);
+      ctx.stroke();
+    }
+  }
+}
+
+function drawSpikes() {
+  ctx.fillStyle = '#c9d2dd';
+  for (const s of world.spikes) {
+    const px = s.x - cameraX; const py = s.y - cameraY;
+    for (let i = 0; i < 4; i++) {
+      ctx.beginPath();
+      ctx.moveTo(px + i * 10, py + s.h);
+      ctx.lineTo(px + i * 10 + 5, py);
+      ctx.lineTo(px + i * 10 + 10, py + s.h);
+      ctx.fill();
+    }
+  }
+}
+
+function drawCoins() {
+  for (const coin of world.coins) {
+    if (coin.collected) continue;
+    coin.bob += 0.08;
+    const px = coin.x - cameraX;
+    const py = coin.y - cameraY + Math.sin(coin.bob) * 4;
+    ctx.fillStyle = '#ffd84d';
+    ctx.beginPath(); ctx.ellipse(px, py, 10, 13, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = '#ffef99'; ctx.lineWidth = 3; ctx.stroke();
+    ctx.strokeStyle = '#c59a00'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(px, py - 10); ctx.lineTo(px, py + 10); ctx.stroke();
+  }
+}
+
+function drawEnemies() {
+  for (const e of world.enemies) {
+    if (!e.alive) continue;
+    const px = e.x - cameraX; const py = e.y - cameraY;
+    ctx.fillStyle = '#7b3fe4'; ctx.fillRect(px, py + 8, e.w, e.h - 8);
+    ctx.fillStyle = '#b99cff'; ctx.fillRect(px + 4, py, e.w - 8, 14);
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(px + 6, py + 8, 5, 5);
+    ctx.fillRect(px + e.w - 11, py + 8, 5, 5);
+    ctx.fillStyle = '#222';
+    ctx.fillRect(px + 7, py + 9, 2, 2);
+    ctx.fillRect(px + e.w - 10, py + 9, 2, 2);
+    ctx.fillStyle = '#2a1b52';
+    ctx.fillRect(px + 4, py + e.h - 4, 8, 4);
+    ctx.fillRect(px + e.w - 12, py + e.h - 4, 8, 4);
+  }
+}
+
+function drawGoal() {
+  const px = world.goal.x - cameraX;
+  const py = world.goal.y - cameraY;
+  ctx.fillStyle = '#d8d8d8'; ctx.fillRect(px, py, 4, world.goal.h + 20);
+  ctx.fillStyle = '#ff5c8a';
+  ctx.beginPath();
+  ctx.moveTo(px + 4, py + 4); ctx.lineTo(px + 38, py + 16); ctx.lineTo(px + 4, py + 28);
+  ctx.closePath(); ctx.fill();
+}
+
+function drawPlayer() {
+  if (player.invuln > 0 && Math.floor(player.invuln / 4) % 2 === 0) return;
+  const px = player.x - cameraX;
+  const py = player.y - cameraY;
+  const legOffset = player.onGround ? Math.sin(player.anim) * 2 : 0;
+  ctx.fillStyle = '#ffcb9d'; ctx.fillRect(px + 6, py + 4, 16, 14);
+  ctx.fillStyle = '#e63946'; ctx.fillRect(px + 4, py, 20, 8); ctx.fillRect(px + 2, py + 6, 24, 4);
+  ctx.fillStyle = '#3559e0';
+  ctx.fillRect(px + 4, py + 18, 20, 12);
+  ctx.fillRect(px + 6, py + 16, 6, 20);
+  ctx.fillRect(px + 16, py + 16, 6, 20);
+  ctx.fillStyle = '#ffcb9d';
+  ctx.fillRect(px + 1, py + 18, 5, 12);
+  ctx.fillRect(px + 22, py + 18, 5, 12);
+  ctx.fillStyle = '#1f2b7f';
+  ctx.fillRect(px + 6, py + 30, 6, 6 + legOffset);
+  ctx.fillRect(px + 16, py + 30, 6, 6 - legOffset);
+  ctx.fillStyle = '#111';
+  const eyeX = player.facing === 1 ? px + 16 : px + 10;
+  ctx.fillRect(eyeX, py + 8, 2, 2);
+}
+
+function drawHud() {
+  ctx.fillStyle = 'rgba(0,0,0,.22)'; ctx.fillRect(14, 14, 300, 56);
+  ctx.fillStyle = '#fff'; ctx.font = 'bold 18px Arial';
+  ctx.fillText(`LEVEL ${currentLevel + 1}`, 26, 36);
+  ctx.fillText(`SCORE ${totalScore}`, 122, 36);
+  ctx.fillText(`LIVES ${globalLives}`, 236, 36);
+  ctx.font = '14px Arial';
+  ctx.fillText(`COINS ${world.coinsCollected}/${world.coinTotal}`, 26, 58);
+}
+
+function drawOverlay() {
+  if (!paused && !gameOver && !gameWon) return;
+  ctx.fillStyle = 'rgba(0,0,0,.36)'; ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+  ctx.fillStyle = '#fff'; ctx.textAlign = 'center'; ctx.font = 'bold 42px Arial';
+  if (gameWon) ctx.fillText('YOU WIN', VIEW_W / 2, VIEW_H / 2 - 10);
+  else if (gameOver) ctx.fillText('GAME OVER', VIEW_W / 2, VIEW_H / 2 - 10);
+  else ctx.fillText('PAUSED', VIEW_W / 2, VIEW_H / 2 - 10);
+  ctx.font = '20px Arial';
+  if (gameWon) ctx.fillText(`Final Score ${totalScore}`, VIEW_W / 2, VIEW_H / 2 + 28);
+  else if (gameOver) ctx.fillText('Press Restart Game', VIEW_W / 2, VIEW_H / 2 + 28);
+  else ctx.fillText('Press Pause / Resume', VIEW_W / 2, VIEW_H / 2 + 28);
+  ctx.textAlign = 'left';
+}
+
+function draw() {
+  drawBackground(); drawGoal(); drawTiles(); drawSpikes();
+  drawCoins(); drawEnemies(); drawPlayer(); drawHud(); drawOverlay();
+}
+
+function update() {
+  if (paused || gameWon || gameOver) return;
+  updatePlayer(); updateCamera(); updateStatus();
+}
+
+function frame() { update(); draw(); requestAnimationFrame(frame); }
+
+document.addEventListener('keydown', (e) => {
+  keys[e.key] = true;
+  if (["ArrowLeft", "ArrowRight", "ArrowUp", " ", "a", "A", "d", "D", "w", "W"].includes(e.key)) e.preventDefault();
+  if (["ArrowUp", " ", "w", "W"].includes(e.key)) player && (player.jumpBuffer = 8);
+  if (e.key === 'r' || e.key === 'R') restartLevel();
+});
+
+document.addEventListener('keyup', (e) => {
+  keys[e.key] = false;
+  if (["ArrowUp", " ", "w", "W"].includes(e.key) && player && player.vy < -4) player.vy *= 0.6;
+});
+
+loadLevel(0, true);
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
